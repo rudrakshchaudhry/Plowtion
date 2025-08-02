@@ -1,0 +1,15 @@
+flask
+flask-cors
+flask-socketio
+pymongo
+python-dotenv
+numpy
+scikit-learn
+joblib
+requests
+pandas
+PyJWT
+eventlet
+gunicorn
+openai
+boto3
