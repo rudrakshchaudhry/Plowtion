@@ -1,621 +1,320 @@
-from flask import Flask, request, jsonify
-from flask_cors import CORS
-from pymongo import MongoClient
+"""Plowtion Flask API.
+
+Run locally:  python backend/app.py   (or: gunicorn -b 0.0.0.0:5001 "app:create_app()")
+Configuration comes from environment variables; see ../.env.example.
+"""
+
+from __future__ import annotations
+
+import logging
 import os
-from dotenv import load_dotenv
-import joblib
-import numpy as np
-from datetime import datetime
-import requests
+from datetime import date, datetime, timezone
+from typing import Any
+
 import pandas as pd
-from bson.objectid import ObjectId
-from urllib.parse import urlparse
-import json
-import asyncio
-import openai
-import boto3 # Import openai for Perplexity API interaction
+from bson import ObjectId
+from bson.errors import InvalidId
+from dotenv import load_dotenv
+from flask import Flask, jsonify, request
+from flask_cors import CORS
+from pymongo.errors import PyMongoError
 
-# Load environment variables
-load_dotenv()
+from plowtion.chat import ChatClient, ChatError, ChatNotConfigured
+from plowtion.config import Config
+from plowtion.model import CropModel, SageMakerPredictor
+from plowtion.schedule import SUPPORTED_CROPS, UnknownCrop, generate_schedule, normalize_crop, schedule_to_text
+from plowtion.storage import Storage, StorageUnavailable
+from plowtion.validation import FEATURE_BOUNDS, ValidationError, parse_number, validate_fields
+from plowtion.weather import WeatherClient, WeatherUnavailable
 
-app = Flask(__name__)
-CORS(app)  # Enable CORS
+log = logging.getLogger("plowtion")
 
-# MongoDB configuration
-MONGO_URI = os.getenv('MONGO_URI')
-client = MongoClient(MONGO_URI)
-db = client["farmnest"]
-users_collection = db["users"]
-user_conditions_collection = db["user_conditions"]  # Collection for user data
-
-# Initialize SageMaker client
-try:
-    sagemaker_runtime = boto3.client(
-        'sagemaker-runtime',
-        region_name=os.getenv('AWS_DEFAULT_REGION')
-    )
-except Exception as e:
-    print(f"Error initializing SageMaker client: {str(e)}")
-    sagemaker_runtime = None
+SOIL_FIELDS = {k: FEATURE_BOUNDS[k] for k in ("N", "P", "K", "ph")}
 
 
-try:
-    zip_data_path = os.path.join(os.path.dirname(__file__), 'dataset', 'zip-code.csv')
-    zip_df = pd.read_csv(zip_data_path)
-except Exception as e:
-    print(f"Error loading ZIP code data: {str(e)}")
-    zip_df = None
+def error(message: str, status: int, **extra: Any):
+    return jsonify({"status": "error", "error": message, **extra}), status
 
-def get_sagemaker_prediction(input_data):
-    """
-    Get predictions from SageMaker endpoint
-    """
+
+def _load_zip_table(path) -> dict[int, dict[str, float]] | None:
     try:
-        # Convert input data to JSON
-        payload = json.dumps(input_data)
-        
-        # Call SageMaker endpoint
-        response = sagemaker_runtime.invoke_endpoint(
-            EndpointName="farmModelEndpoint",
-            ContentType='application/json',
-            Accept='application/json',
-            Body=payload
-        )
-        
-        # Parse response
-        result = json.loads(response['Body'].read())
-        return result.get('predictions', None)
-    
-    except Exception as e:
-        print(f"Error getting SageMaker prediction: {str(e)}")
+        df = pd.read_csv(path)
+    except (OSError, pd.errors.ParserError) as exc:
+        log.warning("could not load ZIP code data from %s: %s", path, exc)
+        return None
+    return {
+        int(row["ZipCode"]): {
+            "nitrogen": float(row["Nitrogen (N)"]),
+            "phosphorus": float(row["Phosphorus (P)"]),
+            "potassium": float(row["Potassium (K)"]),
+            "ph": float(row["pH Level"]),
+        }
+        for row in df.to_dict("records")
+    }
+
+
+def _load_model(cfg: Config) -> CropModel | None:
+    try:
+        model = CropModel.load(cfg.model_path)
+        log.info("loaded model v%s from %s", model.version, cfg.model_path)
+        return model
+    except Exception as exc:  # noqa: BLE001 - any failure means "no local model"
+        log.error("could not load model from %s: %s", cfg.model_path, exc)
         return None
 
 
-# MODEL_PATH = '/Users/aaditya/Desktop/seed/backend/models/Trained_Model.pkl'
+def _serialize(record: dict[str, Any]) -> dict[str, Any]:
+    out = dict(record)
+    out["_id"] = str(out["_id"])
+    if isinstance(out.get("timestamp"), datetime):
+        out["timestamp"] = out["timestamp"].isoformat()
+    return out
 
-# Global variable for the model
-loaded_model = None
 
-def load_model():
-    """Load the trained model from the specified path"""
-    global loaded_model
-    try:
-        MODEL_PATH = os.path.join(os.path.dirname(__file__), 'models', 'Trained_Model.pkl')
-        if os.path.exists(MODEL_PATH):
-            loaded_model = joblib.load(MODEL_PATH)
-            print("Model loaded successfully")
-            return True
-        else:
-            print(f"Model file not found at {MODEL_PATH}")
-            return False
-    except Exception as e:
-        print(f"Error loading model: {str(e)}")
-        return False
+def create_app(
+    config: Config | None = None,
+    *,
+    storage: Storage | None = None,
+    model: CropModel | None = None,
+    weather_client: WeatherClient | None = None,
+    chat_client: ChatClient | None = None,
+) -> Flask:
+    if config is None:
+        load_dotenv()
+        config = Config.from_env()
+    cfg = config
+    app = Flask(__name__)
+    CORS(app, origins=cfg.cors_origins.split(",") if cfg.cors_origins != "*" else "*")
 
-# Load the model when the application starts
-if not load_model():
-    print("Warning: Model failed to load. Predictions will not be available.")
+    model = model or _load_model(cfg)
+    storage = storage or Storage.from_uri(cfg.mongo_uri, cfg.mongo_db_name)
+    weather_client = weather_client or WeatherClient(cfg.weather_base_url, timeout=cfg.http_timeout)
+    chat_client = chat_client or ChatClient(cfg.llm_api_key, cfg.llm_base_url, cfg.llm_model)
+    zip_table = _load_zip_table(cfg.zip_data_path)
 
-@app.route('/predict-conditions', methods=['POST'])
-def predict_conditions():
-    try:
-        if loaded_model is None:
-            return jsonify({"error": "Model not loaded", "status": "error"}), 500
-
-        # Get input data
-        data = request.json
-        username = data.get("username")
-        userID = data.get("userID")
-        gmail = data.get("gmail")
-        zipcode = data.get('zipcode')
-        crop_name = data.get('crop_name').lower() if data.get('crop_name') else None
-
-        if not crop_name:
-            return jsonify({
-                "error": "Crop name is required",
-                "status": "error"
-            }), 400
-
-        # Convert soil parameters to float
+    sagemaker = None
+    if cfg.sagemaker_endpoint and model is not None:
         try:
-            n = float(data.get('n'))
-            p = float(data.get('p'))
-            k = float(data.get('k'))
-            ph = float(data.get('ph'))
-        except (TypeError, ValueError) as e:
-            return jsonify({
-                "error": f"Invalid input values for soil parameters: {str(e)}",
-                "status": "error"
-            }), 400
+            sagemaker = SageMakerPredictor(cfg.sagemaker_endpoint, cfg.aws_region, model.features)
+        except Exception as exc:  # noqa: BLE001 - boto3 missing or misconfigured
+            log.warning("SAGEMAKER_ENDPOINT set but SageMaker client unavailable (%s); using local model", exc)
 
-        # Create initial dataframe with soil parameters
-        input_data = {
-            'N': [n],
-            'P': [p],
-            'K': [k],
-            'ph': [ph]
-        }
+    def json_body() -> Any:
+        return request.get_json(silent=True)
 
-        # Define expected columns in the correct order
-        expected_columns = [
-            'N', 'P', 'K', 'ph', 
-            'label_apple', 'label_banana', 'label_blackgram',
-            'label_chickpea', 'label_coconut', 'label_coffee', 'label_cotton',
-            'label_grapes', 'label_jute', 'label_kidneybeans', 'label_lentil',
-            'label_maize', 'label_mango', 'label_mothbeans', 'label_mungbean',
-            'label_muskmelon', 'label_orange', 'label_papaya', 'label_pigeonpeas',
-            'label_pomegranate', 'label_rice', 'label_watermelon'
-        ]
-
-        # Add crop label columns with 0s
-        for col in expected_columns:
-            if col not in input_data:  # Skip N, P, K, ph which are already added
-                if col == f'label_{crop_name}':
-                    input_data[col] = [1]  # Set selected crop to 1
-                else:
-                    input_data[col] = [0]  # Set all other crops to 0
-
-        # Create DataFrame with all features and ensure correct column order
-        input_df = pd.DataFrame(input_data)
-        input_df = input_df[expected_columns]  # Reorder columns to match expected order
-
-        # Get predictions from the model
-        try:
-            predictions = loaded_model.predict(input_df)[0]
-            # Assuming the model returns [temperature, humidity, rainfall]
-            temperature, humidity, rainfall = predictions
-        except Exception as e:
-            return jsonify({
-                "error": f"Prediction error: {str(e)}",
-                "status": "error",
-                "input_shape": input_df.shape,
-                "features_used": list(input_df.columns)
-            }), 500
-
-        # Get the farming schedule from Perplexity API using predicted values
-        schedule = get_farming_schedule(zipcode, temperature, humidity, rainfall, crop_name)
-
-        # Collect all data to store in MongoDB
-        user_condition_record = {
-            "username": username,
-            "userID": userID,
-            "gmail": gmail,
-            "zipcode": zipcode,
-            "crop_name": crop_name,
-            "soil_conditions": {
-                "nitrogen": n,
-                "phosphorus": p,
-                "potassium": k,
-                "ph": ph
-            },
-            "predicted_conditions": {
-                "temperature": float(temperature),
-                "humidity": float(humidity),
-                "rainfall": float(rainfall)
-            },
-            "schedule": schedule,
-            "timestamp": datetime.now()
-        }
-
-        # Insert into MongoDB
-        user_conditions_collection.insert_one(user_condition_record)
-
-        # Prepare response
-        result = {
-            "username": username,
-            "userID": userID,
-            "gmail": gmail,
-            "soil_conditions": {
-                "nitrogen": n,
-                "phosphorus": p,
-                "potassium": k,
-                "ph": ph
-            },
-            "predicted_conditions": {
-                "temperature": float(temperature),
-                "humidity": float(humidity),
-                "rainfall": float(rainfall)
-            },
-            "schedule": schedule
-        }
-
-        return jsonify({
-            "data": result,
-            "message": "Successfully predicted growing conditions",
-            "status": "success"
-        }), 200
-
-    except Exception as e:
-        return jsonify({
-            "error": str(e),
-            "status": "error"
-        }), 500
-
-@app.route('/test', methods=['GET'])
-def test():
-    return jsonify({"status": "API is running"}), 200
-
-@app.route('/push-user', methods=['POST'])
-def push_user():
-    try:
-        data = request.json
-        result = users_collection.insert_one(data)
-        return jsonify({
-            "message": "User added successfully",
-            "user_id": str(result.inserted_id),
-            "status": "success"
-        }), 200
-    except Exception as e:
-        return jsonify({
-            "error": str(e),
-            "status": "error"
-        }), 500
-
-@app.route('/get-users', methods=['GET'])
-def get_users():
-    try:
-        users = list(users_collection.find())
-        for user in users:
-            user['_id'] = str(user['_id'])
-        return jsonify({
-            "users": users,
-            "count": len(users),
-            "status": "success"
-        }), 200
-    except Exception as e:
-        return jsonify({
-            "error": str(e),
-            "status": "error"
-        }), 500
-
-@app.route('/delete-user/<user_id>', methods=['DELETE'])
-def delete_user(user_id):
-    try:
-        object_id = ObjectId(user_id)
-        result = users_collection.delete_one({"_id": object_id})
-        if result.deleted_count == 1:
-            return jsonify({
-                "message": f"User {user_id} deleted successfully",
-                "status": "success"
-            }), 200
-        else:
-            return jsonify({
-                "message": f"User {user_id} not found",
-                "status": "not_found"
-            }), 404
-    except Exception as e:
-        return jsonify({
-            "error": str(e),
-            "status": "error"
-        }), 500
-
-@app.route('/get-first-ten', methods=['GET'])
-def get_first_ten():
-    try:
-        if zip_df is None:
-            return jsonify({
-                "error": "ZIP code data not loaded",
-                "status": "error"
-            }), 500
-        first_ten = zip_df.head(10).to_dict('records')
-        return jsonify({
-            "data": first_ten,
-            "count": len(first_ten),
-            "status": "success"
-        }), 200
-    except Exception as e:
-        return jsonify({
-            "error": str(e),
-            "status": "error"
-        }), 500
-
-@app.route('/get-soil-by-zip/<zipcode>', methods=['GET'])
-def get_soil_by_zip(zipcode):
-    try:
-        if zip_df is None:
-            return jsonify({
-                "error": "ZIP code data not loaded",
-                "status": "error"
-            }), 500
-        zip_int = int(zipcode)
-        soil_data = zip_df[zip_df['ZipCode'] == zip_int]
-        if soil_data.empty:
-            return jsonify({
-                "message": f"No data found for ZIP code {zipcode}",
-                "status": "not_found"
-            }), 404
-        result = {
-            "zipcode": int(soil_data['ZipCode'].iloc[0]),
-            "nitrogen": float(soil_data['Nitrogen (N)'].iloc[0]),
-            "phosphorus": float(soil_data['Phosphorus (P)'].iloc[0]),
-            "potassium": float(soil_data['Potassium (K)'].iloc[0]),
-            "ph": float(soil_data['pH Level'].iloc[0])
-        }
-        return jsonify({
-            "data": result,
-            "status": "success"
-        }), 200
-    except ValueError:
-        return jsonify({
-            "error": "Invalid ZIP code format",
-            "status": "error"
-        }), 400
-    except Exception as e:
-        return jsonify({
-            "error": str(e),
-            "status": "error"
-        }), 500
-
-def get_farming_schedule(zipcode, temperature, humidity, rainfall, crop):
-    try:
-        PERPLEXITY_API_KEY = os.getenv('PERPLEXITY_API_KEY')
-        if not PERPLEXITY_API_KEY:
-            print("Perplexity API key not set")
-            return None
-
-        url = "https://api.perplexity.ai/chat/completions"
-        headers = {
-            "Authorization": f"Bearer {PERPLEXITY_API_KEY}",
-            "Content-Type": "application/json"
-        }
-
-        # Create the prompt
-        prompt = (
-            f"I live in zipcode {zipcode} and am waiting for conditions of approximately {temperature}°C temperature, "
-            f"{humidity}% relative humidity, and {rainfall} mm rainfall to start planting. Could you provide:\n\n"
-            f"1. The estimated date when these conditions are likely to occur.\n"
-            f"2. A step-by-step growing schedule, starting from that date, which includes:\n"
-            f"-Preparation steps before planting (soil preparation, recommended nutrients).\n"
-            f"-Planting instructions (timing, spacing, depth, and initial watering).\n"
-            f"-Growth phase guidelines (watering frequency, pest and disease management, and any nutrient needs).\n"
-            f"-Harvesting suggestions (ideal time for harvest, techniques, and storage tips for optimal yield).\n"
-            f"Thank you!"
-        )
-        
-
-        payload = {
-            "model": "llama-3.1-sonar-small-128k-online",
-            "messages": [{"role": "user", "content": prompt}],
-            "temperature": 0.2,
-            "max_tokens": 500
-        }
-
-        # Make the API request
-        response = requests.post(url, json=payload, headers=headers)
-
-        # Debug: Print the status code and response
-        print(f"API Response Status Code: {response.status_code}")
-        print("API Response JSON:", response.json())
-
-        response.raise_for_status()
-
-        # Extract the generated text from the response
-        response_data = response.json()
-        schedule = response_data.get('choices', [{}])[0].get('message', {}).get('content', '')
-
-        if not schedule:
-            print("No schedule found in the response.")
-
-        return schedule
-
-    except Exception as e:
-        print(f"Error getting farming schedule: {str(e)}")
-        return None
-
-
-@app.route('/get-user-conditions', methods=['GET'])
-def get_user_conditions():
-    """Get all stored user conditions"""
-    try:
-        records = list(user_conditions_collection.find().sort("timestamp", -1))
-        for record in records:
-            record['_id'] = str(record['_id'])
-            record['timestamp'] = record['timestamp'].isoformat()
-        return jsonify({
-            "user_conditions": records,
-            "count": len(records),
-            "status": "success"
-        }), 200
-    except Exception as e:
-        return jsonify({
-            "error": str(e),
-            "status": "error"
-        }), 500
-    
-@app.route('/api.perplexity.ai/chat/completions', methods=['POST'])
-def perp_api():
-    try:
-        PERPLEXITY_API_KEY = os.getenv('PERPLEXITY_API_KEY')
-        if not PERPLEXITY_API_KEY:
-            return jsonify({"error": "Perplexity API key not set", "status": "error"}), 500
-
-        headers = {
-            "Authorization": f"Bearer {PERPLEXITY_API_KEY}",
-            "Content-Type": "application/json"
-        }
-
-        response = openai.ChatCompletion.create(
-            model="llama-3.1-sonar-small-128k-online",
-            messages=[
-                {
-                    "role": "system",
-                    "content": "Be precise and concise."
-                },
-                {
-                    "role": "user",
-                    "content": "How many stars are there in our galaxy?"
-                }
-            ],
-            max_tokens=100,
-            temperature=0.2,
-            top_p=0.9,
-            search_domain_filter=["perplexity.ai"],
-            return_images=False,
-            return_related_questions=False,
-            search_recency_filter="month",
-            top_k=0,
-            stream=False,
-            presence_penalty=0,
-            frequency_penalty=1,
-            headers=headers
+    # ------------------------------------------------------------------ health
+    @app.get("/health")
+    def health():
+        return jsonify(
+            {
+                "status": "ok",
+                "model": {"loaded": model is not None, "version": model.version if model else None},
+                "inference": "sagemaker" if sagemaker else "local",
+                "database": "connected" if storage.ping() else ("unavailable" if storage.configured else "not_configured"),
+                "chat": "configured" if chat_client.configured else "not_configured",
+                "zip_data": zip_table is not None,
+            }
         )
 
-        return jsonify({
-            "response": response,
-            "status": "success"
-        }), 200
+    # ------------------------------------------------------- crop recommender
+    @app.post("/predict")
+    def predict():
+        if model is None:
+            return error("model not loaded; run `python backend/train.py`", 503)
+        try:
+            values = validate_fields(json_body(), FEATURE_BOUNDS)
+        except ValidationError as exc:
+            return error("invalid input", 400, details=exc.errors)
 
-    except Exception as e:
-        return jsonify({
-            "error": str(e),
-            "status": "error"
-        }), 500
+        source = "local"
+        result = None
+        if sagemaker is not None:
+            try:
+                result = sagemaker.predict(values)
+                source = "sagemaker"
+            except Exception as exc:  # noqa: BLE001
+                log.warning("SageMaker prediction failed (%s); falling back to local model", exc)
+        if result is None:
+            result = model.predict(values)
+        return jsonify({"status": "success", "data": {**result, "input": values, "source": source, "model_version": model.version}})
 
-@app.route('/get-user-condition/<condition_id>', methods=['GET'])
-def get_user_condition(condition_id):
-    """Get a specific user condition by ID"""
-    try:
-        record = user_conditions_collection.find_one({"_id": ObjectId(condition_id)})
-        if not record:
-            return jsonify({
-                "message": f"Record {condition_id} not found",
-                "status": "not_found"
-            }), 404
-        record['_id'] = str(record['_id'])
-        record['timestamp'] = record['timestamp'].isoformat()
-        return jsonify({
-            "user_condition": record,
-            "status": "success"
-        }), 200
-    except Exception as e:
-        return jsonify({
-            "error": str(e),
-            "status": "error"
-        }), 500
+    @app.get("/crops")
+    def crops():
+        return jsonify({"status": "success", "crops": SUPPORTED_CROPS})
 
-@app.route('/api_print', methods=['GET'])
-def api_print():
-    try:
-        PERPLEXITY_API_KEY = os.getenv('PERPLEXITY_API_KEY')
-        if not PERPLEXITY_API_KEY:
-            return jsonify({"error": "Perplexity API key not set", "status": "error"}), 500
-        return jsonify({"message": "API is running", "PERPLEXITY_API_KEY": PERPLEXITY_API_KEY}), 200
-    except Exception as e:
-        return jsonify({
-            "error": str(e),
-            "status": "error"
-        }), 500
+    # ---------------------------------------------------------------- schedule
+    @app.post("/schedule")
+    def schedule():
+        body = json_body()
+        if not isinstance(body, dict):
+            return error("request body must be a JSON object", 400)
+        try:
+            crop = normalize_crop(body.get("crop"))
+        except UnknownCrop as exc:
+            return error(str(exc), 400)
+        start_raw = body.get("start_date")
+        try:
+            start = date.fromisoformat(start_raw) if start_raw else date.today()
+        except (TypeError, ValueError):
+            return error("start_date must be an ISO date (YYYY-MM-DD)", 400)
+        profile = model.crop_profiles.get(crop) if model else None
+        return jsonify({"status": "success", "data": generate_schedule(crop, start, profile)})
 
-@app.route('/check-perplexity', methods=['POST'])
-def check_perplexity():
-    """Endpoint to check if Perplexity API is working"""
-    try:
-        # Retrieve the Perplexity API key from environment variables
-        PERPLEXITY_API_KEY = os.getenv('PERPLEXITY_API_KEY')
-        if not PERPLEXITY_API_KEY:
-            return jsonify({"error": "Perplexity API key not set", "status": "error"}), 500
+    # ----------------------------------------------------------------- weather
+    @app.get("/weather")
+    def weather():
+        try:
+            lat = parse_number(request.args.get("lat"), "lat", (-90, 90))
+            lon = parse_number(request.args.get("lon"), "lon", (-180, 180))
+            days = int(parse_number(request.args.get("days", "7"), "days", (1, 16)))
+        except ValidationError as exc:
+            return error("invalid input", 400, details=exc.errors)
+        try:
+            data = weather_client.forecast(lat, lon, days)
+        except WeatherUnavailable as exc:
+            return error(str(exc), 503)
+        return jsonify({"status": "success", "data": data})
 
-        # Set up the headers for the request
-        headers = {
-            "Authorization": f"Bearer {PERPLEXITY_API_KEY}",
-            "Content-Type": "application/json"
+    # -------------------------------------------------------------------- chat
+    @app.post("/chat")
+    def chat():
+        if not chat_client.configured:
+            return error("chatbot is not configured: set LLM_API_KEY to enable it", 503, code="chat_not_configured")
+        body = json_body()
+        message = body.get("message") if isinstance(body, dict) else None
+        if not isinstance(message, str) or not message.strip():
+            return error("message is required", 400)
+        if len(message) > 2000:
+            return error("message must be at most 2000 characters", 400)
+        try:
+            return jsonify({"status": "success", "data": {"reply": chat_client.ask(message.strip())}})
+        except ChatNotConfigured as exc:
+            return error(str(exc), 503, code="chat_not_configured")
+        except ChatError as exc:
+            return error(str(exc), 502)
+
+    # -------------------------------------------------------- soil by ZIP code
+    @app.get("/get-soil-by-zip/<zipcode>")
+    def get_soil_by_zip(zipcode: str):
+        if zip_table is None:
+            return error("ZIP code data not loaded", 503)
+        if not zipcode.isdigit() or len(zipcode) > 5:
+            return error("invalid ZIP code format", 400)
+        soil = zip_table.get(int(zipcode))
+        if soil is None:
+            return jsonify({"status": "not_found", "error": f"no data for ZIP code {zipcode}"}), 404
+        return jsonify({"status": "success", "data": {"zipcode": int(zipcode), **soil}})
+
+    # ------------------------------------------- growing conditions (frontend)
+    @app.post("/predict-conditions")
+    def predict_conditions():
+        """Typical growing conditions + schedule for a crop, given soil readings.
+
+        Conditions come from the per-crop statistics of the training dataset.
+        """
+        if model is None:
+            return error("model not loaded; run `python backend/train.py`", 503)
+        body = json_body()
+        if not isinstance(body, dict):
+            return error("request body must be a JSON object", 400)
+        try:
+            crop = normalize_crop(body.get("crop_name"))
+        except UnknownCrop as exc:
+            return error(str(exc), 400)
+        try:
+            soil = validate_fields(body, SOIL_FIELDS)
+        except ValidationError as exc:
+            return error("invalid input", 400, details=exc.errors)
+
+        profile = model.crop_profiles.get(crop)
+        if profile is None:
+            return error(f"no profile for crop '{crop}'", 400)
+        conditions = {k: profile[k]["mean"] for k in ("temperature", "humidity", "rainfall")}
+        soil_fit = {}
+        for key in SOIL_FIELDS:
+            lo, hi = profile[key]["min"], profile[key]["max"]
+            soil_fit[key] = {"value": soil[key], "range": [lo, hi], "status": "low" if soil[key] < lo else "high" if soil[key] > hi else "ok"}
+        plan = generate_schedule(crop, date.today(), profile)
+
+        soil_conditions = {"nitrogen": soil["N"], "phosphorus": soil["P"], "potassium": soil["K"], "ph": soil["ph"]}
+        result = {
+            "username": body.get("username"),
+            "userID": body.get("userID"),
+            "gmail": body.get("gmail"),
+            "zipcode": body.get("zipcode"),
+            "crop_name": crop,
+            "soil_conditions": soil_conditions,
+            "predicted_conditions": conditions,
+            "soil_fit": soil_fit,
+            "schedule": schedule_to_text(plan),
+            "schedule_details": plan,
         }
 
-        # Get the JSON payload from the incoming POST request
-        incoming_data = request.get_json()
+        saved = False
+        if storage.configured:
+            try:
+                storage.collection("user_conditions").insert_one({**result, "timestamp": datetime.now(timezone.utc)})
+                saved = True
+            except PyMongoError as exc:
+                log.warning("could not save prediction: %s", exc)
+        result["saved"] = saved
+        return jsonify({"status": "success", "message": "Typical growing conditions for the selected crop", "data": result})
 
-        # Define the JSON payload for the request to Perplexity API
-        data = {
-            "model": incoming_data.get("model", "llama-3.1-sonar-small-128k-online"),
-            "messages": incoming_data.get("messages", [
-                {
-                    "role": "system",
-                    "content": "Be precise and concise."
-                },
-                {
-                    "role": "user",
-                    "content": "How many stars are there in our galaxy?"
-                }
-            ]),
-            "max_tokens": incoming_data.get("max_tokens", 100),
-            "temperature": incoming_data.get("temperature", 0.2),
-        }
+    # ------------------------------------------------------- storage endpoints
+    @app.errorhandler(StorageUnavailable)
+    def storage_unavailable(exc):
+        return error(str(exc), 503)
 
-        # Make the request to the Perplexity API
-        response = requests.post("https://api.perplexity.ai/chat/completions", headers=headers, json=data)
+    @app.errorhandler(PyMongoError)
+    def mongo_error(exc):
+        log.warning("database error: %s", exc)
+        return error("database unavailable", 503)
 
-        # Check for a successful response
-        if response.status_code == 200:
-            response_data = response.json()
-            content = response_data.get("choices", [{}])[0].get("message", {}).get("content", "")
-            citations = response_data.get("citations", [])
+    @app.post("/push-user")
+    def push_user():
+        body = json_body()
+        if not isinstance(body, dict) or not body:
+            return error("request body must be a non-empty JSON object", 400)
+        body.pop("_id", None)
+        inserted = storage.collection("users").insert_one(body)
+        return jsonify({"status": "success", "message": "User added", "user_id": str(inserted.inserted_id)})
 
-            return jsonify({
-                "message": "Perplexity API is working",
-                "response": content,
-                "citations": citations,
-                "status": "success"
-            }), 200
-        else:
-            # Return the error message if the API call was not successful
-            return jsonify({
-                "message": "Perplexity API is not working",
-                "status": "error",
-                "error_details": response.json()  # Include any error details from Perplexity
-            }), response.status_code
+    @app.get("/get-users")
+    def get_users():
+        users = [_serialize(u) for u in storage.collection("users").find().limit(500)]
+        return jsonify({"status": "success", "users": users, "count": len(users)})
 
-    except Exception as e:
-        # Catch any other exceptions and return an error message
-        return jsonify({
-            "error": str(e),
-            "status": "error"
-        }), 500
+    @app.delete("/delete-user/<user_id>")
+    def delete_user(user_id: str):
+        try:
+            oid = ObjectId(user_id)
+        except InvalidId:
+            return error("invalid user id", 400)
+        if storage.collection("users").delete_one({"_id": oid}).deleted_count == 1:
+            return jsonify({"status": "success", "message": f"User {user_id} deleted"})
+        return jsonify({"status": "not_found", "error": f"User {user_id} not found"}), 404
 
-@app.route('/test-perplexity', methods=['POST'])
-def test_perplexity():
-    try:
-        PERPLEXITY_API_KEY = os.getenv('PERPLEXITY_API_KEY')
-        if not PERPLEXITY_API_KEY:
-            return jsonify({"error": "Perplexity API key not set", "status": "error"}), 500
+    @app.get("/get-user-conditions")
+    def get_user_conditions():
+        records = storage.collection("user_conditions").find().sort("timestamp", -1).limit(500)
+        records = [_serialize(r) for r in records]
+        return jsonify({"status": "success", "user_conditions": records, "count": len(records)})
 
-        url = "https://api.perplexity.ai/chat/completions"
-        headers = {
-            "Authorization": f"Bearer {PERPLEXITY_API_KEY}",
-            "Content-Type": "application/json"
-        }
+    @app.get("/get-user-condition/<condition_id>")
+    def get_user_condition(condition_id: str):
+        try:
+            oid = ObjectId(condition_id)
+        except InvalidId:
+            return error("invalid record id", 400)
+        record = storage.collection("user_conditions").find_one({"_id": oid})
+        if record is None:
+            return jsonify({"status": "not_found", "error": f"Record {condition_id} not found"}), 404
+        return jsonify({"status": "success", "user_condition": _serialize(record)})
 
-        payload = {
-            "model": "llama-3.1-sonar-small-128k-online",
-            "messages": [
-                {"role": "system", "content": "Be precise and concise."},
-                {"role": "user", "content": "How many stars are there in our galaxy?"}
-            ],
-            "max_tokens": 100,
-            "temperature": 0.2,
-            "top_p": 0.9,
-            "search_domain_filter": ["perplexity.ai"],
-            "return_images": False,
-            "return_related_questions": False,
-            "search_recency_filter": "month",
-            "top_k": 0,
-            "stream": False,
-            "presence_penalty": 0,
-            "frequency_penalty": 1
-        }
+    return app
 
-        response = requests.post(url, json=payload, headers=headers)
-        response.raise_for_status()
 
-        return jsonify({
-            "response": response.json(),
-            "status": "success"
-        }), 200
-
-    except Exception as e:
-        return jsonify({
-            "error": str(e),
-            "status": "error"
-        }), 500
-
-if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=5001, debug=True)
+if __name__ == "__main__":
+    load_dotenv()
+    logging.basicConfig(level=logging.INFO)
+    create_app().run(host="0.0.0.0", port=int(os.getenv("PORT", "5001")), debug=os.getenv("FLASK_DEBUG") == "1")
