@@ -31,13 +31,9 @@ ENV/
 .env*
 !.env.example
 
-# Model files
-models/
+# Model files (the trained artifact lives in ../model/ and is committed)
 *.pkl
-*.joblib
 *.h5
-*.model
-crop_model.joblib
 
 # Database
 *.db
