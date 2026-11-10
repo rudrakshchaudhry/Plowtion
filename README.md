@@ -1,305 +1,138 @@
-# 🌱 Plowtion - AI-Powered Crop Management Platform
+# Plowtion
 
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-[![Python](https://img.shields.io/badge/Python-3.8+-blue.svg)](https://www.python.org/)
-[![Next.js](https://img.shields.io/badge/Next.js-15.0+-black.svg)](https://nextjs.org/)
-[![Docker](https://img.shields.io/badge/Docker-Enabled-blue.svg)](https://www.docker.com/)
+Plowtion is a small full-stack farming assistant. Given soil and climate readings it
+recommends a crop with a scikit-learn model; given a crop it reports the typical growing
+conditions from the training data and generates an approximate planting-to-harvest
+schedule. It also exposes a keyless weather forecast and an optional chatbot.
 
-Plowtion harnesses the power of AI to generate personalized crop schedules tailored to your specific location and crop type. By integrating real-time weather data, we help farmers make informed decisions that optimize growth and maximize yield, adapting to the challenges posed by changing climate conditions.
+Built as a team project. This repository has been updated so that everything below runs
+locally without the original cloud services.
 
-## ✨ Features
-
-- **🤖 AI-Powered Crop Recommendations**: Machine learning model provides personalized crop suggestions based on environmental factors
-- **📅 Smart Scheduling**: Generate optimized planting and harvesting schedules
-- **🌤️ Weather Integration**: Real-time weather data integration for informed decision-making
-- **🛒 Marketplace**: Robust platform for buying and selling seeds and farming equipment
-- **💬 AI Chatbot**: NLP-powered assistant providing instant farming tips and guidance
-- **👤 User Profiles**: Personalized farmer profiles and preferences
-- **🔐 Secure Authentication**: OAuth integration with Google authentication
-
-## 🏗️ Project Structure
+## Architecture
 
 ```
-Plowtion/
-├── backend/                 # Python Flask API
-│   ├── app.py              # Main Flask application
-│   ├── dataset/            # ML training datasets
-│   ├── requirements.txt    # Python dependencies
-│   └── Dockerfile         # Backend container config
-├── frontend/               # Next.js React application
-│   ├── app/               # Next.js app directory
-│   ├── components/        # Reusable React components
-│   ├── lib/              # Utility libraries
-│   ├── services/         # API service layer
-│   └── Dockerfile        # Frontend container config
-├── model/                 # Machine learning models
-│   └── crop_model.joblib # Trained crop recommendation model
-└── docker-compose.yml    # Multi-container orchestration
+frontend/   Next.js 15 (App Router) UI: home form, crop guide, marketplace, profile.
+            Optional Google sign-in via Auth.js (NextAuth v5).
+backend/    Flask API
+  app.py            routes (create_app factory)
+  train.py          trains the crop recommender, writes model/ artifacts
+  plowtion/         config, model wrapper, schedule rules, weather + chat clients, storage
+  dataset/          Crop_recommendation.csv (2,200 rows, 22 crops), zip-code.csv (soil by US ZIP)
+  tests/            pytest suite (offline)
+model/      crop_model.joblib (trained pipeline + per-crop profiles), metrics.json
+docker-compose.yml  frontend + backend + local MongoDB
 ```
 
-## 🚀 Quick Start
+Request flow on the home page: ZIP code -> `GET /get-soil-by-zip/<zip>` (soil N, P, K, pH
+from `zip-code.csv`) -> `POST /predict-conditions` (typical temperature, humidity and
+rainfall for the selected crop, soil-range check, and a schedule).
 
-### Prerequisites
+### API
 
-- **Docker & Docker Compose** (recommended)
-- **Python 3.8+** (for local development)
-- **Node.js 18+** (for local development)
-- **MongoDB** (included in Docker setup)
+| Method | Path | Purpose | Needs |
+|---|---|---|---|
+| GET | `/health` | Model, database, chat status | - |
+| POST | `/predict` | Recommend a crop from `N, P, K, temperature, humidity, ph, rainfall` | - |
+| GET | `/crops` | Supported crop names | - |
+| POST | `/schedule` | Schedule for `{"crop": "maize", "start_date": "YYYY-MM-DD"}` | - |
+| GET | `/weather?lat=..&lon=..&days=7` | Current conditions and daily forecast (Open-Meteo) | Internet |
+| POST | `/chat` | `{"message": "..."}`; returns 503 when no LLM key is set | LLM API key |
+| GET | `/get-soil-by-zip/<zip>` | Soil readings for a US ZIP code | - |
+| POST | `/predict-conditions` | Growing conditions and schedule for a crop + soil readings | - (saves to MongoDB if configured) |
+| POST/GET/DELETE | `/push-user`, `/get-users`, `/delete-user/<id>`, `/get-user-conditions`, `/get-user-condition/<id>` | Stored users and past results | MongoDB |
 
-### 🐳 Docker Setup (Recommended)
+`/predict` validates every field and returns 400 with per-field details for missing,
+non-numeric or out-of-range values (for example pH outside 0-14 or humidity outside 0-100).
 
-1. **Clone the repository**
+The Flask API has no authentication of its own. Run it on a trusted network only.
+
+## What works locally and what needs external services
+
+| Feature | Local, no accounts | Notes |
+|---|---|---|
+| Crop recommendation (`/predict`) | Yes | Local scikit-learn model. SageMaker is used only if `SAGEMAKER_ENDPOINT` is set (requires `pip install boto3` and AWS credentials; that path is not tested here). |
+| Growing conditions + schedule | Yes | Conditions are per-crop averages from the dataset; the schedule is rule-based and approximate. |
+| Soil lookup by ZIP code | Yes | Static CSV bundled in the repo. |
+| Weather | Yes, with internet access | Open-Meteo, no API key. Returns 503 if the service is unreachable. |
+| Storage of users / results | Yes, with MongoDB | `docker compose` starts a local `mongo`; or set `MONGO_URI`. Without it, storage endpoints return 503 and everything else works. |
+| Chatbot | No | Needs an OpenAI-compatible API key (`LLM_API_KEY`, default provider Perplexity). Without it `/chat` returns 503 "not configured". The frontend has no chat UI. |
+| Google sign-in | No | Needs your own Google OAuth client (`AUTH_GOOGLE_ID`, `AUTH_GOOGLE_SECRET`, `AUTH_SECRET`). Without them the sign-in buttons are hidden and the app runs signed-out. |
+| Marketplace | Display only | Static product list; there is no checkout, payment or seller flow. |
+| Profile page | Display only | Shows the signed-in user's name and photo; the rest is placeholder content. |
+
+## Quick start (local, no Docker)
+
+Requires Python 3.12 and Node.js 22.
+
+1. Clone and create a virtual environment:
    ```bash
-   git clone <repository-url>
-   cd Plowtion
+   git clone https://github.com/rudrakshchaudhry/Plowtion.git && cd Plowtion
+   python3 -m venv .venv && source .venv/bin/activate
+   ```
+2. Install backend dependencies and run the tests (offline, about 5 seconds):
+   ```bash
+   pip install -r backend/requirements-dev.txt
+   (cd backend && pytest -q)
+   ```
+3. Optionally retrain the model (about 3 seconds; overwrites `model/crop_model.joblib` and `model/metrics.json`):
+   ```bash
+   python backend/train.py
+   ```
+4. Start the API and try it:
+   ```bash
+   python backend/app.py        # http://localhost:5001
+   curl localhost:5001/health
+   curl -X POST localhost:5001/predict -H 'Content-Type: application/json' \
+     -d '{"N":90,"P":42,"K":43,"temperature":20.88,"humidity":82.0,"ph":6.5,"rainfall":202.9}'
+   ```
+5. In a second terminal, build and start the frontend:
+   ```bash
+   cd frontend && cp .env.example .env.local
+   npm ci && npm run build && npm start   # http://localhost:3000
    ```
 
-2. **Configure environment variables**
-   ```bash
-   cp .env.example .env
-   # Edit .env with your actual API keys and secrets
-   ```
+Configuration is read from environment variables only. Copy `.env.example` to `.env`
+(backend, loaded by `python backend/app.py`) and `frontend/.env.example` to
+`frontend/.env.local`; every value is optional.
 
-3. **Start the application**
-   ```bash
-   docker-compose up -d
-   ```
-
-4. **Access the application**
-   - Frontend: http://localhost:3000
-   - Backend API: http://localhost:5000
-   - MongoDB: localhost:27017
-
-### 💻 Local Development Setup
-
-#### Backend Setup
-
-1. **Navigate to backend directory**
-   ```bash
-   cd backend
-   ```
-
-2. **Create virtual environment**
-   ```bash
-   python -m venv venv
-   source venv/bin/activate  # On Windows: venv\Scripts\activate
-   ```
-
-3. **Install dependencies**
-   ```bash
-   pip install -r requirements.txt
-   ```
-
-4. **Set environment variables**
-   ```bash
-   export FLASK_ENV=development
-   export PERPLEXITY_API_KEY=your_api_key_here
-   # ... other environment variables from .env.example
-   ```
-
-5. **Run the Flask application**
-   ```bash
-   python app.py
-   ```
-
-#### Frontend Setup
-
-1. **Navigate to frontend directory**
-   ```bash
-   cd frontend
-   ```
-
-2. **Install dependencies**
-   ```bash
-   npm install
-   ```
-
-3. **Set environment variables**
-   ```bash
-   cp .env.example .env.local
-   # Edit .env.local with your values
-   ```
-
-4. **Run the development server**
-   ```bash
-   npm run dev
-   ```
-
-## 🔑 Environment Variables
-
-### Required API Keys
-
-- **PERPLEXITY_API_KEY**: For AI chatbot functionality
-- **WEATHER_API_KEY**: For weather data integration  
-- **GOOGLE_CLIENT_ID & GOOGLE_CLIENT_SECRET**: For OAuth authentication
-- **NEXTAUTH_SECRET**: For NextAuth.js session encryption
-- **AWS_ACCESS_KEY_ID & AWS_SECRET_ACCESS_KEY**: For AWS services
-
-### Configuration
-
-Create a `.env` file based on `.env.example` and fill in your actual values:
+### Docker
 
 ```bash
-# API Keys
-PERPLEXITY_API_KEY=your_perplexity_api_key
-WEATHER_API_KEY=your_weather_api_key
-GOOGLE_CLIENT_ID=your_google_client_id
-GOOGLE_CLIENT_SECRET=your_google_client_secret
-
-# Security
-NEXTAUTH_SECRET=your_secure_random_string
-NEXTAUTH_URL=http://localhost:3000
-
-# Database
-MONGODB_URI=mongodb://localhost:27017/plowtion
-
-# AWS (if using AWS services)
-AWS_ACCESS_KEY_ID=your_aws_access_key
-AWS_SECRET_ACCESS_KEY=your_aws_secret_key
-AWS_REGION=us-east-1
+cp .env.example .env
+docker compose up --build
 ```
 
-## 📚 API Documentation
+This starts MongoDB, the API on port 5001 and the frontend on port 3000. The compose file
+has been validated with `docker compose config`; the images were not built as part of this
+update.
 
-### Base URL
-- Development: `http://localhost:5000`
-- Production: `https://your-domain.com/api`
+## Model
 
-### Key Endpoints
+`backend/train.py` trains a `Pipeline(StandardScaler, RandomForestClassifier)` on the seven
+features `N, P, K, temperature, humidity, ph, rainfall` to predict one of 22 crops, and
+evaluates it with 5-fold stratified cross-validation (shuffle, `random_state=42`). It is
+deterministic: re-running it reproduces the numbers below. Current results from
+`model/metrics.json` (model version 2.0.0, scikit-learn 1.9.1, 2,200 rows):
 
-| Method | Endpoint | Description |
-|--------|----------|-------------|
-| GET | `/` | Health check |
-| POST | `/predict` | Get crop recommendations |
-| POST | `/chat` | Chat with AI assistant |
-| GET | `/crops` | Get crop information |
-| POST | `/schedule` | Generate crop schedule |
+| Metric | Mean | Std |
+|---|---|---|
+| Accuracy | 0.9950 | 0.0022 |
+| Macro-F1 | 0.9950 | 0.0022 |
 
-### Example API Usage
+The dataset is small and clean, with 100 rows per crop and well-separated classes, so these
+scores say little about performance on real field measurements.
 
-```javascript
-// Get crop recommendation
-const response = await fetch('/api/predict', {
-  method: 'POST',
-  headers: { 'Content-Type': 'application/json' },
-  body: JSON.stringify({
-    nitrogen: 40,
-    phosphorus: 50,
-    potassium: 30,
-    temperature: 25,
-    humidity: 80,
-    ph: 6.5,
-    rainfall: 200
-  })
-});
-```
+## Tests and CI
 
-## 🧪 Testing
+`backend/tests` covers the health endpoint, prediction (happy path and validation errors),
+schedule generation, the weather client (success, timeout, error, malformed payload) with
+mocked HTTP, the chatbot-not-configured path, and storage via `mongomock`. A fixture blocks
+all network access during tests.
 
-### Backend Tests
-```bash
-cd backend
-python -m pytest tests/
-```
+GitHub Actions (`.github/workflows/ci.yml`) runs the backend tests, a training sanity check
+(fails below 0.95 CV accuracy) and the frontend production build with placeholder
+environment values.
 
-### Frontend Tests
-```bash
-cd frontend
-npm test
-```
+## License
 
-## 🚀 Deployment
-
-### Docker Production Deployment
-
-1. **Build production images**
-   ```bash
-   docker-compose -f docker-compose.prod.yml build
-   ```
-
-2. **Deploy with production configuration**
-   ```bash
-   docker-compose -f docker-compose.prod.yml up -d
-   ```
-
-### Cloud Deployment
-
-The application is containerized and can be deployed on:
-- **AWS ECS/EKS**
-- **Google Cloud Run**
-- **Azure Container Instances**
-- **DigitalOcean App Platform**
-
-## 🤝 Contributing
-
-1. Fork the repository
-2. Create a feature branch (`git checkout -b feature/AmazingFeature`)
-3. Commit your changes (`git commit -m 'Add some AmazingFeature'`)
-4. Push to the branch (`git push origin feature/AmazingFeature`)
-5. Open a Pull Request
-
-### Development Guidelines
-
-- Follow PEP 8 for Python code
-- Use ESLint and Prettier for JavaScript/TypeScript
-- Write tests for new features
-- Update documentation for API changes
-- Ensure Docker builds pass
-
-## 🔒 Security
-
-- **No hardcoded secrets**: All sensitive data is managed through environment variables
-- **Authentication**: Secure OAuth integration
-- **API Security**: Rate limiting and input validation
-- **Data Protection**: Encrypted data transmission
-
-## 📈 Roadmap
-
-- [ ] Mobile application (React Native)
-- [ ] Advanced weather predictions
-- [ ] IoT sensor integration
-- [ ] Multi-language support
-- [ ] Advanced analytics dashboard
-- [ ] Integration with farming equipment APIs
-
-## 🐛 Troubleshooting
-
-### Common Issues
-
-**Docker containers not starting**
-- Check Docker daemon is running
-- Verify environment variables are set
-- Check port conflicts (3000, 5000, 27017)
-
-**API authentication errors**
-- Verify Google OAuth credentials
-- Check NEXTAUTH_SECRET is set
-- Ensure NEXTAUTH_URL matches your domain
-
-**Database connection issues**
-- Verify MongoDB is running
-- Check MONGODB_URI format
-- Ensure network connectivity between containers
-
-## 📄 License
-
-This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
-
-## 🙏 Acknowledgments
-
-- **Scikit-learn** for machine learning capabilities
-- **Next.js** for the robust frontend framework
-- **Flask** for the lightweight backend API
-- **Perplexity AI** for intelligent chatbot functionality
-- **MongoDB** for flexible data storage
-
-## 📞 Support
-
-For support and questions:
-- Create an issue on GitHub
-- Join our community discussions
-- Check the documentation wiki
-
----
-
-Built with ❤️ for farmers around the world 🌾
+MIT. See [LICENSE](LICENSE).
