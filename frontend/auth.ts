@@ -14,13 +14,13 @@ declare module "next-auth" {
 }
 
 export const { auth, handlers, signIn, signOut } = NextAuth({
-    adapter: MongoDBAdapter(client),
+    ...(client ? { adapter: MongoDBAdapter(client) } : {}),
     ...authConfig,
     callbacks: {
         async session({ session, user }) {
             if (user) {
                 session.user.role = "user";
-                session.user.image = user.image;
+                session.user.image = user.image ?? undefined;
             }
             return session;
         },

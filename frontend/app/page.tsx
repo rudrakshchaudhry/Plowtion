@@ -1,8 +1,10 @@
 "use client"
 import { useState } from 'react';
 import Image from 'next/image';
-import { signIn } from 'next-auth/react';
-import { Cloud, Droplets, Thermometer } from 'lucide-react';
+import { signIn, useSession } from 'next-auth/react';
+import { Cloud, Droplets, Thermometer, type LucideIcon } from 'lucide-react';
+import { API_BASE_URL } from '@/lib/config';
+import { useAuthEnabled } from '@/lib/useAuthEnabled';
 
 interface SoilData {
   nitrogen: number;
@@ -13,9 +15,8 @@ interface SoilData {
 
 interface PredictionResult {
   data: {
-    username: string;
-    userID: string;
-    gmail: string;
+    username: string | null;
+    gmail: string | null;
     soil_conditions: {
       nitrogen: number;
       phosphorus: number;
@@ -40,10 +41,12 @@ export default function Home() {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
   const [soilData, setSoilData] = useState<SoilData | null>(null);
+  const { data: session } = useSession();
+  const authEnabled = useAuthEnabled();
 
-  const handleZipCodeSubmit = async () => {
+  const handleZipCodeSubmit = async (): Promise<SoilData | null> => {
     try {
-      const response = await fetch(`http://localhost:5001/get-soil-by-zip/${zipcode}`);
+      const response = await fetch(`${API_BASE_URL}/get-soil-by-zip/${encodeURIComponent(zipcode)}`);
       const data = await response.json();
 
       if (!response.ok) {
@@ -57,22 +60,18 @@ export default function Home() {
         ph: data.data.ph
       };
       setSoilData(soil);
+      return soil;
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to fetch soil data');
+      return null;
     }
   };
 
-  const handlePredict = async () => {
-    if (!soilData) {
-      setError('Please get soil data first');
-      return;
-    }
-
+  const handlePredict = async (soilData: SoilData) => {
     try {
       const predictionData = {
-        username: "user1",
-        userID: "123",
-        gmail: "user@example.com",
+        username: session?.user?.name ?? null,
+        gmail: session?.user?.email ?? null,
         zipcode: zipcode,
         crop_name: selectedCrop,
         n: soilData.nitrogen,
@@ -81,7 +80,7 @@ export default function Home() {
         ph: soilData.ph
       };
 
-      const response = await fetch('http://localhost:5001/predict-conditions', {
+      const response = await fetch(`${API_BASE_URL}/predict-conditions`, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -107,9 +106,10 @@ export default function Home() {
     setError('');
 
     try {
-      await handleZipCodeSubmit();
-      if (soilData) {
-        await handlePredict();
+      setPredictionResult(null);
+      const soil = await handleZipCodeSubmit();
+      if (soil) {
+        await handlePredict(soil);
       }
     } catch (err) {
       setError(err instanceof Error ? err.message : 'An error occurred');
@@ -119,7 +119,7 @@ export default function Home() {
   };
 
   const WeatherCard = ({ icon: Icon, title, value, unit, bgColor }: {
-    icon: any;
+    icon: LucideIcon;
     title: string;
     value: number;
     unit: string;
@@ -151,12 +151,14 @@ export default function Home() {
           <h1 className="text-5xl font-bold text-gray-900 dark:text-white">
             Smart Farming Assistant
           </h1>
-          <button 
-            onClick={() => signIn("google")}
-            className="px-6 py-2 bg-white text-gray-800 rounded-lg shadow-md hover:bg-gray-50 transition-colors"
-          >
-            Sign In With Google
-          </button>
+          {authEnabled && !session?.user && (
+            <button 
+              onClick={() => signIn("google")}
+              className="px-6 py-2 bg-white text-gray-800 rounded-lg shadow-md hover:bg-gray-50 transition-colors"
+            >
+              Sign In With Google
+            </button>
+          )}
           <p className="text-xl text-gray-600 dark:text-gray-300">
             Get personalized crop recommendations based on your location
           </p>

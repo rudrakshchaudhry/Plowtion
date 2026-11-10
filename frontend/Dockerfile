@@ -1,24 +1,16 @@
-FROM node:18-alpine
-
+FROM node:22-alpine AS build
 WORKDIR /app
-
-# Add these environment variables
-ENV NEXTAUTH_URL=http://localhost:3000
-# Environment variables should be set at runtime
-# ENV NEXTAUTH_SECRET will be provided via docker-compose or runtime
-
-# Copy package files first
-COPY package*.json ./
-RUN npm install
-
-# Copy auth configuration files specifically
-COPY auth.config.ts ./
-COPY auth.ts ./
-COPY middleware.ts ./
-
-# Copy the rest of the application
+COPY package.json package-lock.json ./
+RUN npm ci
 COPY . .
+# Inlined into the client bundle at build time.
+ARG NEXT_PUBLIC_API_URL=http://localhost:5001
+ENV NEXT_PUBLIC_API_URL=$NEXT_PUBLIC_API_URL
+RUN npm run build
 
+FROM node:22-alpine
+WORKDIR /app
+ENV NODE_ENV=production
+COPY --from=build /app ./
 EXPOSE 3000
-
-CMD ["npm", "run", "dev"]
+CMD ["npm", "run", "start"]

@@ -1,31 +1,19 @@
 import { NextResponse } from 'next/server';
 import { auth } from '@/auth';
-
-export async function GET() {
-    const session = await auth();
-    if (!session) {
-        return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
-    }
-
-    const response = await fetch(`${process.env.NEXT_PUBLIC_API_URL}/user/${session.user.email}`, {
-        method: 'GET',
-        headers: {
-            'Content-Type': 'application/json',
-        },
-    });
-
-    const data = await response.json();
-    return NextResponse.json(data);
-}
+import { authEnabled } from '@/auth.config';
+import { SERVER_API_BASE_URL } from '@/lib/config';
 
 export async function POST(request: Request) {
+    if (!authEnabled) {
+        return NextResponse.json({ error: 'Authentication is not configured' }, { status: 503 });
+    }
     const session = await auth();
     if (!session) {
         return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
     }
 
     const body = await request.json();
-    const response = await fetch(`${process.env.NEXT_PUBLIC_API_URL}/push-user`, {
+    const response = await fetch(`${SERVER_API_BASE_URL}/push-user`, {
         method: 'POST',
         headers: {
             'Content-Type': 'application/json',
@@ -39,5 +27,5 @@ export async function POST(request: Request) {
     });
 
     const data = await response.json();
-    return NextResponse.json(data);
-} 
+    return NextResponse.json(data, { status: response.status });
+}
