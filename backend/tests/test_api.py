@@ -2,6 +2,8 @@ from datetime import date
 
 import pytest
 
+from conftest import ADMIN, ADMIN_TOKEN
+
 from plowtion.chat import ChatClient
 from plowtion.storage import Storage
 
@@ -119,7 +121,7 @@ def test_predict_conditions_saves_when_db_available(client, mongo_db):
     assert "Harvest window" in data["schedule"]
     assert data["saved"] is True
     assert mongo_db["user_conditions"].count_documents({}) == 1
-    listed = client.get("/get-user-conditions").get_json()
+    listed = client.get("/get-user-conditions", headers=ADMIN).get_json()
     assert listed["count"] == 1
 
 
@@ -129,8 +131,8 @@ def test_predict_conditions_works_without_db(make_app):
     assert res.status_code == 200
     assert res.get_json()["data"]["saved"] is False
     # storage-only endpoints report 503 instead of crashing
-    assert client.get("/get-users").status_code == 503
-    assert client.post("/push-user", json={"email": "a@example.com"}).status_code == 503
+    assert client.get("/get-users", headers=ADMIN).status_code == 503
+    assert client.post("/push-user", json={"email": "a@example.com"}, headers=ADMIN).status_code == 503
 
 
 def test_predict_conditions_validation(client):
@@ -140,13 +142,45 @@ def test_predict_conditions_validation(client):
 
 
 def test_user_roundtrip(client):
-    res = client.post("/push-user", json={"email": "farmer@example.com", "name": "Farmer"})
+    res = client.post("/push-user", json={"email": "farmer@example.com", "name": "Farmer"}, headers=ADMIN)
     assert res.status_code == 200
     user_id = res.get_json()["user_id"]
-    assert client.get("/get-users").get_json()["count"] == 1
-    assert client.delete(f"/delete-user/{user_id}").status_code == 200
-    assert client.delete(f"/delete-user/{user_id}").status_code == 404
-    assert client.delete("/delete-user/not-an-id").status_code == 400
+    assert client.get("/get-users", headers=ADMIN).get_json()["count"] == 1
+    assert client.delete(f"/delete-user/{user_id}", headers=ADMIN).status_code == 200
+    assert client.delete(f"/delete-user/{user_id}", headers=ADMIN).status_code == 404
+    assert client.delete("/delete-user/not-an-id", headers=ADMIN).status_code == 400
+
+
+USER_DATA_ROUTES = [
+    ("post", "/push-user"),
+    ("get", "/get-users"),
+    ("delete", "/delete-user/000000000000000000000000"),
+    ("get", "/get-user-conditions"),
+    ("get", "/get-user-condition/000000000000000000000000"),
+]
+
+
+@pytest.mark.parametrize("method,path", USER_DATA_ROUTES)
+def test_user_data_routes_reject_missing_or_wrong_token(client, method, path):
+    call = getattr(client, method)
+    kwargs = {"json": {"email": "x@example.com"}} if method == "post" else {}
+    assert call(path, **kwargs).status_code == 401
+    assert call(path, headers={"Authorization": "Bearer wrong"}, **kwargs).status_code == 401
+    assert call(path, headers={"Authorization": f"Basic {ADMIN_TOKEN}"}, **kwargs).status_code == 401
+
+
+@pytest.mark.parametrize("method,path", USER_DATA_ROUTES)
+def test_user_data_routes_disabled_without_admin_token(make_app, config, method, path):
+    config.admin_token = None
+    client = make_app().test_client()
+    res = getattr(client, method)(path, headers=ADMIN)
+    assert res.status_code == 503
+    assert res.get_json()["code"] == "admin_not_configured"
+
+
+def test_open_endpoints_need_no_token(client):
+    assert client.get("/health").status_code == 200
+    assert client.get("/crops").status_code == 200
 
 
 class _FakeResponse:

@@ -6,8 +6,10 @@ Configuration comes from environment variables; see ../.env.example.
 
 from __future__ import annotations
 
+import hmac
 import logging
 import os
+from functools import wraps
 from datetime import date, datetime, timezone
 from typing import Any
 
@@ -101,6 +103,25 @@ def create_app(
 
     def json_body() -> Any:
         return request.get_json(silent=True)
+
+    def require_admin(view):
+        """Guard the user-data endpoints with a shared secret (ADMIN_TOKEN).
+
+        Callers send `Authorization: Bearer <token>`. Without a configured token the
+        endpoints are disabled, so a fresh deployment never exposes stored users.
+        """
+
+        @wraps(view)
+        def wrapper(*args, **kwargs):
+            if not cfg.admin_token:
+                return error("user-data endpoints are disabled: set ADMIN_TOKEN to enable them", 503, code="admin_not_configured")
+            header = request.headers.get("Authorization", "")
+            scheme, _, supplied = header.partition(" ")
+            if scheme.lower() != "bearer" or not hmac.compare_digest(supplied.strip().encode(), cfg.admin_token.encode()):
+                return error("missing or invalid admin token", 401)
+            return view(*args, **kwargs)
+
+        return wrapper
 
     # ------------------------------------------------------------------ health
     @app.get("/health")
@@ -271,6 +292,7 @@ def create_app(
         return error("database unavailable", 503)
 
     @app.post("/push-user")
+    @require_admin
     def push_user():
         body = json_body()
         if not isinstance(body, dict) or not body:
@@ -280,11 +302,13 @@ def create_app(
         return jsonify({"status": "success", "message": "User added", "user_id": str(inserted.inserted_id)})
 
     @app.get("/get-users")
+    @require_admin
     def get_users():
         users = [_serialize(u) for u in storage.collection("users").find().limit(500)]
         return jsonify({"status": "success", "users": users, "count": len(users)})
 
     @app.delete("/delete-user/<user_id>")
+    @require_admin
     def delete_user(user_id: str):
         try:
             oid = ObjectId(user_id)
@@ -295,12 +319,14 @@ def create_app(
         return jsonify({"status": "not_found", "error": f"User {user_id} not found"}), 404
 
     @app.get("/get-user-conditions")
+    @require_admin
     def get_user_conditions():
         records = storage.collection("user_conditions").find().sort("timestamp", -1).limit(500)
         records = [_serialize(r) for r in records]
         return jsonify({"status": "success", "user_conditions": records, "count": len(records)})
 
     @app.get("/get-user-condition/<condition_id>")
+    @require_admin
     def get_user_condition(condition_id: str):
         try:
             oid = ObjectId(condition_id)
