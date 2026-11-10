@@ -107,6 +107,7 @@ export default function Home() {
 
     try {
       setPredictionResult(null);
+      setSoilData(null);
       const soil = await handleZipCodeSubmit();
       if (soil) {
         await handlePredict(soil);

@@ -53,7 +53,7 @@ The Flask API has no authentication of its own. Run it on a trusted network only
 | Crop recommendation (`/predict`) | Yes | Local scikit-learn model. SageMaker is used only if `SAGEMAKER_ENDPOINT` is set (requires `pip install boto3` and AWS credentials; that path is not tested here). |
 | Growing conditions + schedule | Yes | Conditions are per-crop averages from the dataset; the schedule is rule-based and approximate. |
 | Soil lookup by ZIP code | Yes | Static CSV bundled in the repo. |
-| Weather | Yes, with internet access | Open-Meteo, no API key. Returns 503 if the service is unreachable. |
+| Weather | Yes, with internet access | Open-Meteo, no API key. API only (`/weather`); the frontend does not display it yet. Returns 503 if the service is unreachable. |
 | Storage of users / results | Yes, with MongoDB | `docker compose` starts a local `mongo`; or set `MONGO_URI`. Without it, storage endpoints return 503 and everything else works. |
 | Chatbot | No | Needs an OpenAI-compatible API key (`LLM_API_KEY`, default provider Perplexity). Without it `/chat` returns 503 "not configured". The frontend has no chat UI. |
 | Google sign-in | No | Needs your own Google OAuth client (`AUTH_GOOGLE_ID`, `AUTH_GOOGLE_SECRET`, `AUTH_SECRET`). Without them the sign-in buttons are hidden and the app runs signed-out. |
@@ -69,7 +69,7 @@ Requires Python 3.12 and Node.js 22.
    git clone https://github.com/rudrakshchaudhry/Plowtion.git && cd Plowtion
    python3 -m venv .venv && source .venv/bin/activate
    ```
-2. Install backend dependencies and run the tests (offline, about 5 seconds):
+2. Install backend dependencies and run the tests (offline, under 10 seconds):
    ```bash
    pip install -r backend/requirements-dev.txt
    (cd backend && pytest -q)
@@ -126,7 +126,8 @@ scores say little about performance on real field measurements.
 
 `backend/tests` covers the health endpoint, prediction (happy path and validation errors),
 schedule generation, the weather client (success, timeout, error, malformed payload) with
-mocked HTTP, the chatbot-not-configured path, and storage via `mongomock`. A fixture blocks
+mocked HTTP, the chatbot (not configured, mocked provider response and provider error), and
+storage via `mongomock`. A fixture blocks
 all network access during tests.
 
 GitHub Actions (`.github/workflows/ci.yml`) runs the backend tests, a training sanity check
