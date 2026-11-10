@@ -12,17 +12,26 @@ export async function POST(request: Request) {
         return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
     }
 
-    const body = await request.json();
+    const adminToken = process.env.ADMIN_TOKEN;
+    if (!adminToken) {
+        return NextResponse.json({ error: 'ADMIN_TOKEN is not configured on the server' }, { status: 503 });
+    }
+
+    const body = await request.json().catch(() => ({}));
+    const extra = body && typeof body === 'object' && !Array.isArray(body) ? body : {};
     const response = await fetch(`${SERVER_API_BASE_URL}/push-user`, {
         method: 'POST',
         headers: {
             'Content-Type': 'application/json',
+            Authorization: `Bearer ${adminToken}`,
         },
+        // Identity fields come from the verified session and are applied last,
+        // so the request body cannot overwrite them.
         body: JSON.stringify({
-            email: session.user.email,
-            name: session.user.name,
-            image: session.user.image,
-            ...body
+            ...extra,
+            email: session.user?.email,
+            name: session.user?.name,
+            image: session.user?.image,
         }),
     });
 

@@ -26,9 +26,14 @@ def no_network(monkeypatch):
     monkeypatch.setattr(socket, "getaddrinfo", guard)
 
 
+ADMIN_TOKEN = "test-admin-token"
+ADMIN = {"Authorization": f"Bearer {ADMIN_TOKEN}"}
+
+
 @pytest.fixture
 def config():
-    return Config()  # defaults only: no Mongo URI, no LLM key, no SageMaker
+    # defaults only (no Mongo URI, no LLM key, no SageMaker), plus an admin token
+    return Config(admin_token=ADMIN_TOKEN)
 
 
 @pytest.fixture

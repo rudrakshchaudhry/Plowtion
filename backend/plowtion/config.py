@@ -48,6 +48,10 @@ class Config:
 
     cors_origins: str = "*"
 
+    # Shared secret for the user-data endpoints (/push-user, /get-users, ...).
+    # When unset those endpoints are disabled.
+    admin_token: str | None = None
+
     @classmethod
     def from_env(cls) -> "Config":
         model_path = _env("MODEL_PATH")
@@ -64,4 +68,5 @@ class Config:
             weather_base_url=_env("WEATHER_BASE_URL", "https://api.open-meteo.com/v1/forecast"),
             http_timeout=float(_env("HTTP_TIMEOUT_SECONDS", "5")),
             cors_origins=_env("CORS_ORIGINS", "*"),
+            admin_token=_env("ADMIN_TOKEN"),
         )

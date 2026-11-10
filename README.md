@@ -39,12 +39,14 @@ rainfall for the selected crop, soil-range check, and a schedule).
 | POST | `/chat` | `{"message": "..."}`; returns 503 when no LLM key is set | LLM API key |
 | GET | `/get-soil-by-zip/<zip>` | Soil readings for a US ZIP code | - |
 | POST | `/predict-conditions` | Growing conditions and schedule for a crop + soil readings | - (saves to MongoDB if configured) |
-| POST/GET/DELETE | `/push-user`, `/get-users`, `/delete-user/<id>`, `/get-user-conditions`, `/get-user-condition/<id>` | Stored users and past results | MongoDB |
+| POST/GET/DELETE | `/push-user`, `/get-users`, `/delete-user/<id>`, `/get-user-conditions`, `/get-user-condition/<id>` | Stored users and past results | MongoDB + `ADMIN_TOKEN` |
 
 `/predict` validates every field and returns 400 with per-field details for missing,
 non-numeric or out-of-range values (for example pH outside 0-14 or humidity outside 0-100).
 
-The Flask API has no authentication of its own. Run it on a trusted network only.
+The user-data endpoints require `Authorization: Bearer $ADMIN_TOKEN` and are disabled
+when `ADMIN_TOKEN` is unset. The other endpoints are open; run the API on a trusted
+network or behind an authenticating proxy, and add rate limiting before exposing it.
 
 ## What works locally and what needs external services
 
