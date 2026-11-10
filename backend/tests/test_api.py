@@ -147,3 +147,44 @@ def test_user_roundtrip(client):
     assert client.delete(f"/delete-user/{user_id}").status_code == 200
     assert client.delete(f"/delete-user/{user_id}").status_code == 404
     assert client.delete("/delete-user/not-an-id").status_code == 400
+
+
+class _FakeResponse:
+    def __init__(self, payload, status=200):
+        self._payload, self.status_code = payload, status
+
+    def raise_for_status(self):
+        if self.status_code >= 400:
+            import requests
+
+            raise requests.HTTPError(f"{self.status_code}")
+
+    def json(self):
+        return self._payload
+
+
+def test_chat_client_parses_provider_response(monkeypatch):
+    import plowtion.chat as chat_mod
+
+    captured = {}
+
+    def fake_post(url, json, headers, timeout):
+        captured.update(url=url, json=json, headers=headers, timeout=timeout)
+        return _FakeResponse({"choices": [{"message": {"content": "Plant after the last frost."}}]})
+
+    monkeypatch.setattr(chat_mod.requests, "post", fake_post)
+    client = ChatClient("test-key", "https://llm.invalid/", "test-model")
+    assert client.ask("When to plant maize?") == "Plant after the last frost."
+    assert captured["url"] == "https://llm.invalid/chat/completions"
+    assert captured["headers"]["Authorization"] == "Bearer test-key"
+    assert captured["json"]["model"] == "test-model"
+
+
+def test_chat_provider_error_returns_502(make_app, monkeypatch):
+    import plowtion.chat as chat_mod
+
+    monkeypatch.setattr(chat_mod.requests, "post", lambda *a, **k: _FakeResponse({}, status=401))
+    client = make_app(chat_client=ChatClient("bad-key", "https://llm.invalid", "m")).test_client()
+    res = client.post("/chat", json={"message": "hi"})
+    assert res.status_code == 502
+    assert "bad-key" not in res.get_data(as_text=True)
