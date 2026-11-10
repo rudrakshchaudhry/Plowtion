@@ -1,0 +1,41 @@
+{
+  "model_version": "2.0.0",
+  "model_type": "Pipeline(StandardScaler, RandomForestClassifier)",
+  "sklearn_version": "1.9.1",
+  "dataset": "backend/dataset/Crop_recommendation.csv",
+  "dataset_sha256": "54a5a6e5408668e668667efc50de2fc867c1b875e0431b4f54dd331b0a109a4e",
+  "n_samples": 2200,
+  "n_classes": 22,
+  "features": [
+    "N",
+    "P",
+    "K",
+    "temperature",
+    "humidity",
+    "ph",
+    "rainfall"
+  ],
+  "cv": {
+    "strategy": "StratifiedKFold(n_splits=5, shuffle=True, random_state=42)",
+    "accuracy_mean": 0.995,
+    "accuracy_std": 0.0022,
+    "f1_macro_mean": 0.995,
+    "f1_macro_std": 0.0022,
+    "accuracy_per_fold": [
+      0.9955,
+      0.9955,
+      0.9977,
+      0.9955,
+      0.9909
+    ],
+    "f1_macro_per_fold": [
+      0.9954,
+      0.9954,
+      0.9977,
+      0.9955,
+      0.9909
+    ]
+  },
+  "artifact": "crop_model.joblib",
+  "artifact_size_bytes": 489294
+}
