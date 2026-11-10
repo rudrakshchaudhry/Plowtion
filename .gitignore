@@ -1,0 +1,17 @@
+# Local environment and secrets
+.env
+.env.*
+!.env.example
+.venv/
+venv/
+
+# Python / tooling caches
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Node
+node_modules/
+.next/
+
+.DS_Store
