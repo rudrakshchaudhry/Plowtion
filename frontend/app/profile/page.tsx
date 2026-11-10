@@ -43,7 +43,7 @@ export default function Profile() {
           </div>
           <div>
             <h2 className="text-xl font-semibold text-gray-900 dark:text-white">
-              {session?.user?.name || FARMER_DATA.name}
+              {session?.user?.name || "Farmer"}
             </h2>
             <p className="text-gray-500 dark:text-gray-400">Member since {FARMER_DATA.since}</p>
             <p className="text-gray-500 dark:text-gray-400">{FARMER_DATA.location}</p>

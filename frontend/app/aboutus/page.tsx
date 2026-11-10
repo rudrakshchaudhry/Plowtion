@@ -89,7 +89,7 @@ export default function AboutUs() {
               <div className="flex-grow">
                 <h3 className="text-xl font-semibold mb-2 text-gray-900 dark:text-white">Enter Your Location</h3>
                 <p className="text-gray-600 dark:text-gray-300">
-                  Start by providing your ZIP code or location to get recommendations tailored to your area's climate and soil conditions.
+                  Start by providing your ZIP code or location to get recommendations tailored to your area&apos;s climate and soil conditions.
                 </p>
               </div>
             </div>

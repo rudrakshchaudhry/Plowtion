@@ -4,9 +4,11 @@ import Link from "next/link";
 import { usePathname } from "next/navigation";
 import { useState, useEffect } from "react";
 import { useSession, signOut, signIn } from "next-auth/react";
+import { useAuthEnabled } from "@/lib/useAuthEnabled";
 
 const NavBar = () => {
   const { data: session } = useSession();
+  const authEnabled = useAuthEnabled();
   const path = usePathname();
   const [isMenuOpen, setIsMenuOpen] = useState(false);
   const [isDarkMode, setIsDarkMode] = useState(false);
@@ -92,14 +94,14 @@ const NavBar = () => {
                 Sign Out
               </button>
             </div>
-          ) : (
+          ) : authEnabled ? (
             <button 
               onClick={() => signIn("google")}
               className="text-sm bg-green-600 text-white px-4 py-2 rounded-md hover:bg-green-700 transition-colors"
             >
               Sign In
             </button>
-          )}
+          ) : null}
         </div>
 
         {/* Mobile Menu Button */}
@@ -157,11 +159,11 @@ const NavBar = () => {
                   Sign Out
                 </button>
               </>
-            ) : (
+            ) : authEnabled ? (
               <>
                 <button onClick={() => signIn("google")}>Sign In With Google</button>
               </>
-            )}
+            ) : null}
           </div>
         </div>
       </div>

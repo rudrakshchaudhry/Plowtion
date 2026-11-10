@@ -54,6 +54,8 @@ const CATEGORIES = [
   'Fertilizers'
 ] as const;
 
+type Category = (typeof CATEGORIES)[number];
+
 export default function Marketplace() {
   const [selectedCategory, setSelectedCategory] = useState<Category>('All Categories');
   const [isDropdownOpen, setIsDropdownOpen] = useState(false);
